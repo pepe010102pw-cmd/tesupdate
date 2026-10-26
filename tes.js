@@ -1,6 +1,6 @@
 /* ============================================================
    iRiLLL MODZ — LOGIC.JS (full: UI + features + toggles)
-   version: 2.5.3  (POV Aimlock — must be visible & inside screen)
+   version: 2.5.4  (Dual aimbot: POV / Legacy + POV slider)
    License: LOCAL KEYLIST (offline, no pastefy)
    ============================================================ */
 (function () {
@@ -42,8 +42,6 @@
   function pfValidate(key, cb) {
     var target = String(key).trim();
     if (!target) { cb(false, 'invalid'); return; }
-    // Case-sensitive match. Kalau mau case-insensitive, ganti baris di bawah:
-    // var ok = PF_LOCAL_KEYS.some(function (k) { return k.toLowerCase() === target.toLowerCase(); });
     var ok = PF_LOCAL_KEYS.some(function (k) { return k === target; });
     if (ok) {
       pfSet(PF_TOKEN_LS, 'ok_' + Date.now());
@@ -113,7 +111,6 @@
           st.textContent = 'Memverifikasi…';
           btnOk.disabled = true;
           btnOk.style.opacity = '.7';
-          // Validasi lokal — instan, tanpa fetch
           pfValidate(k, function (ok, reason) {
             btnOk.disabled = false;
             btnOk.style.opacity = '1';
@@ -184,7 +181,7 @@
      BOOT CORE — seluruh logic fitur asli ada di sini
      ============================================================ */
   function bootCore() {
-    var V = '2.5.3';
+    var V = '2.5.4';
     var BRAND = 'iRiLLL MODZ';
     function log() { try { console.log.apply(console, ['[iR]'].concat([].slice.call(arguments))); } catch (e) {} }
 
@@ -280,7 +277,9 @@
 
     var HIDDEN = { pb: null, pbvis: null, pbnade: null, pbqc: null, pbx: null };
 
-    var P = { cone: 0.45, reach: 150, autoFire: 0, gain: 0.9, headR: 0.11, mode: 'near', bias: 0.35 };
+    // P — aim params. aimMode: 'pov' (default) atau 'legacy'
+    // povMargin: 0.30 (cuma tengah) .. 0.98 (hampir seluruh layar)
+    var P = { cone: 0.45, reach: 150, autoFire: 0, gain: 0.9, headR: 0.11, mode: 'near', bias: 0.35, aimMode: 'pov', povMargin: 0.90 };
     var O = { sens: 0.5, fov: 70, invert: false };
     function readOpts() {
       try {
@@ -294,6 +293,14 @@
     }
     readOpts();
     try { addEventListener('pbopts', function () { readOpts(); }); } catch (e) {}
+
+    // restore aimMode + povMargin dari localStorage
+    try {
+      var _am = localStorage.getItem('ir_aimmode');
+      if (_am === 'legacy' || _am === 'pov') P.aimMode = _am;
+      var _pm = parseFloat(localStorage.getItem('ir_povmargin'));
+      if (isFinite(_pm) && _pm >= 0.30 && _pm <= 0.98) P.povMargin = _pm;
+    } catch (e) {}
 
     var G = null, aimOn = true, fireHeld = 0, nextTap = 0, holding = false;
     var lastPick = null, st = { v: V, aim: true, G: false, bots: 0, enemies: 0, lock: 0, err: 0, fire: 0, dist: 0 };
@@ -329,7 +336,7 @@
     function wpos(b, out) { var e = b.matrixWorld.elements; out.x = e[12]; out.y = e[13]; out.z = e[14]; return out; }
     var A = { x: 0, y: 0, z: 0 }, B = { x: 0, y: 0, z: 0 };
 
-    /* ===== POV / LOS AIM HELPERS (v2.5.3) ===== */
+    /* ===== POV / LOS AIM HELPERS ===== */
     var _hpOut = { x: 0, y: 0, z: 0 };
     var _pv = null, _pDir = { x: 0, y: 0, z: 0 };
 
@@ -348,18 +355,17 @@
       return _hpOut;
     }
 
-    // target wajib masuk area layar (NDC). margin 0.90 = 90% layar, 10% pinggir diabaikan
+    // target wajib masuk area layar (NDC). margin bisa diatur via slider (0.30..0.98)
     function isInsidePOV(cam, hp, margin) {
       try {
         if (!_pv) _pv = cam.position.clone();
         var ndc = _pv.set(hp.x, hp.y, hp.z).project(cam);
-        var m = (margin == null) ? 0.90 : margin;
+        var m = (margin == null) ? P.povMargin : margin;
         if (!(ndc.z > -1 && ndc.z < 1)) return false;
         return Math.abs(ndc.x) <= m && Math.abs(ndc.y) <= m;
       } catch (e) { return false; }
     }
 
-    // target wajib kelihatan (tidak terhadap dinding). g.cast return truthy = kena halangan
     function hasLineOfSight(g, cam, hp) {
       try {
         if (typeof g.cast !== 'function') return true;
@@ -373,7 +379,6 @@
       } catch (e) { return true; }
     }
 
-    // bot harus beneran valid (bukan dummy/dead/removed)
     function isBotReal(p) {
       if (!p || !p.obj || !p.c) return false;
       if (p.dead || !(p.hp > 0)) return false;
@@ -423,6 +428,10 @@
       var yaw = +self.yaw || 0, pitch = +self.pitch || 0;
       var cp = Math.cos(pitch);
       F.x = -Math.sin(yaw) * cp; F.y = Math.sin(pitch); F.z = -Math.cos(yaw) * cp;
+
+      var useLegacy = (P.aimMode === 'legacy');   // <-- toggle mode
+      var povM = P.povMargin;                     // <-- slider POV
+
       var best = null, bestP = null, bestA = 1e9, bestD = 1e9, myTeam = self.team, list = g.bots, n = 0, en = 0;
       for (var i = 0; i < list.length; i++) {
         var p = list[i];
@@ -436,17 +445,16 @@
         var d = Math.sqrt(dx * dx + dy * dy + dz * dz);
         if (d < 2 || d > P.reach) continue;
 
-        // SYARAT 1 — wajib masuk area layar (POV)
-        if (!isInsidePOV(cam, hp, 0.90)) continue;
-
-        // SYARAT 2 — wajib kelihatan (tidak terhadap dinding)
-        if (!hasLineOfSight(g, cam, hp)) continue;
+        // ---- POV MODE filters ----
+        if (!useLegacy) {
+          if (!isInsidePOV(cam, hp, povM)) continue;   // target wajib masuk POV
+          if (!hasLineOfSight(g, cam, hp)) continue;   // target wajib kelihatan
+        }
 
         en++;
         var ey = wrap(Math.atan2(-dx, -dz) - yaw);
         var ep = Math.asin(clamp(dy / d, -1, 1)) - pitch;
         var a = Math.sqrt(ey * ey + ep * ep);
-        // SYARAT 3 — masih dalam cone internal (biar smooth)
         if (a > P.cone) continue;
 
         var better = (P.mode === 'angle') ? (a < bestA) : (d < bestD - P.bias || (d <= bestD + P.bias && a < bestA));
@@ -455,9 +463,11 @@
       st.bots = n; st.enemies = en;
       if (!best || !aimOn) { lastPick = null; st.lock = 0; if (holding) up(); return; }
 
-      // RE-VERIFY sebelum lock (anti aim tembus dinding / keluar layar)
-      if (!isInsidePOV(cam, bestP, 0.95) || !hasLineOfSight(g, cam, bestP)) {
-        lastPick = null; st.lock = 0; if (holding) up(); return;
+      // ---- POV MODE re-verify ----
+      if (!useLegacy) {
+        if (!isInsidePOV(cam, bestP, Math.min(0.98, povM + 0.05)) || !hasLineOfSight(g, cam, bestP)) {
+          lastPick = null; st.lock = 0; if (holding) up(); return;
+        }
       }
 
       var t = O.sens * (cam.fov / O.fov) * 0.005;
@@ -472,8 +482,10 @@
 
       if (!(P.autoFire || fireHeld) || now < nextTap || holding) return;
 
-      // fire guard — hanya nembak kalau kelihatan (wallbang tetap boleh kalau aktif)
-      if (!hasLineOfSight(g, cam, bestP) && !FL.wallbang) return;
+      // ---- POV MODE fire guard ----
+      if (!useLegacy) {
+        if (!hasLineOfSight(g, cam, bestP) && !FL.wallbang) return;
+      }
 
       var hit = null;
       try { hit = best.hitTest(C, F, P.reach); } catch (e) { hit = null; }
@@ -510,10 +522,33 @@
     };
 
     var PB_API = {
-      state: function () { return { v: V, aim: aimOn, G: !!G, bots: st.bots, enemies: st.enemies, lock: st.lock, dist: +st.dist.toFixed(2), mode: P.mode, err: +(st.err * 57.2958).toFixed(2), fire: fireHeld, autoFire: P.autoFire, sens: O.sens, fov: O.fov }; },
+      state: function () {
+        return {
+          v: V, aim: aimOn, G: !!G,
+          bots: st.bots, enemies: st.enemies, lock: st.lock,
+          dist: +st.dist.toFixed(2), mode: P.mode, aimMode: P.aimMode, povMargin: P.povMargin,
+          err: +(st.err * 57.2958).toFixed(2), fire: fireHeld, autoFire: P.autoFire,
+          sens: O.sens, fov: O.fov
+        };
+      },
       cfg: function (o) { if (o) for (var k in o) if (k in P) P[k] = o[k]; return P; },
       on: function () { aimOn = true; st.aim = true; return 'on'; },
       off: function () { aimOn = false; st.aim = false; up(); return 'off'; },
+      // API baru: set aim mode + pov margin
+      aimMode: function (mode) {
+        if (mode === 'pov' || mode === 'legacy') {
+          P.aimMode = mode;
+          try { localStorage.setItem('ir_aimmode', mode); } catch (e) {}
+        }
+        return P.aimMode;
+      },
+      povMargin: function (v) {
+        if (typeof v === 'number' && v >= 0.30 && v <= 0.98) {
+          P.povMargin = v;
+          try { localStorage.setItem('ir_povmargin', String(v)); } catch (e) {}
+        }
+        return P.povMargin;
+      },
       list: function () {
         var g = game(); if (!g) return 'no G';
         return (g.bots || []).map(function (p) {
@@ -1714,6 +1749,8 @@
         '.fk-row small{color:#94a3b8;font-size:10px}',
         '.fk-row .risk-badge{display:inline-block;padding:0 4px;margin-left:4px;border-radius:3px;font-size:8px;',
         '  background:#f59e0b;color:#fff;font-weight:900;vertical-align:middle;letter-spacing:.3px;line-height:10px}',
+        '.fk-row .new-badge{display:inline-block;padding:0 4px;margin-left:4px;border-radius:3px;font-size:8px;',
+        '  background:#10b981;color:#fff;font-weight:900;vertical-align:middle;letter-spacing:.3px;line-height:10px}',
         '.fk-sw{position:relative;width:38px;height:20px;flex:0 0 38px;border-radius:10px;background:#cbd5e1;transition:background .15s;cursor:pointer}',
         '.fk-sw::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.2);transition:transform .15s}',
         '.fk-sw.on{background:#7c3aed}',
@@ -1733,7 +1770,11 @@
         '.fk-btn.danger:hover{background:#fee2e2}',
         '.fk-foot{margin-top:8px;padding-top:6px;border-top:1px solid #e2e8f0;font-size:10px;color:#64748b;font-variant-numeric:tabular-nums}',
         '.fk-warn{margin-top:6px;padding:5px 7px;border-radius:6px;background:#fffbeb;border:1px solid #fcd34d;',
-        '  color:#92400e;font-size:10px;line-height:1.3}'
+        '  color:#92400e;font-size:10px;line-height:1.3}',
+        '.fk-hint{font-size:10px;color:#94a3b8;line-height:1.3;padding:2px 0 4px}',
+        '.fk-badge{display:inline-block;padding:1px 6px;border-radius:3px;font-size:9px;font-weight:800;letter-spacing:.3px}',
+        '.fk-badge.pov{background:#dbeafe;color:#1e40af}',
+        '.fk-badge.legacy{background:#fee2e2;color:#991b1b}'
       ].join('');
 
       var style = document.createElement('style');
@@ -1782,6 +1823,14 @@
         var r = el('div', 'fk-row');
         var lb = el('label', null, label);
         lb.appendChild(el('span', 'risk-badge', 'RISK'));
+        if (smallTxt) lb.appendChild(el('small', null, ' ' + smallTxt));
+        r.appendChild(lb); r.appendChild(node);
+        return r;
+      }
+      function rowNew(label, node, smallTxt) {
+        var r = el('div', 'fk-row');
+        var lb = el('label', null, label);
+        lb.appendChild(el('span', 'new-badge', 'NEW'));
         if (smallTxt) lb.appendChild(el('small', null, ' ' + smallTxt));
         r.appendChild(lb); r.appendChild(node);
         return r;
@@ -1839,8 +1888,43 @@
         if (panel.classList.contains('collapsed')) setCollapsed(false);
       }
 
-      /* TAB 1 — AIM */
+      /* ============ TAB 1 — AIM ============ */
       var pAim = addTab('aim', 'AIM');
+
+      // == Mode info ==
+      pAim.appendChild(el('div', 'fk-sec', 'Aim Mode'));
+      var modeInfo = el('div', 'fk-hint', '');
+      pAim.appendChild(modeInfo);
+
+      function updateModeInfo() {
+        var badge = (P.aimMode === 'legacy')
+          ? '<span class="fk-badge legacy">LEGACY</span>'
+          : '<span class="fk-badge pov">POV</span>';
+        var desc = (P.aimMode === 'legacy')
+          ? 'Aim lama: target di mana saja (tembus dinding / di luar layar).'
+          : 'Target wajib <b>kelihatan</b> &amp; masuk area layar.';
+        modeInfo.innerHTML = badge + ' ' + desc;
+      }
+      updateModeInfo();
+
+      // == POV Mode toggle (default ON, legacy OFF) ==
+      var povT = toggle(P.aimMode !== 'legacy', function (on) {
+        window.__pb.aimMode(on ? 'pov' : 'legacy');
+        updateModeInfo();
+      });
+      pAim.appendChild(row('POV mode', povT.node, '(wajib kelihatan)'));
+
+      // == POV margin slider ==
+      var povS = slider(0.30, 0.98, 0.01, P.povMargin,
+        function (v) { return Math.round(v * 100) + '%'; },
+        function (v) { window.__pb.povMargin(v); });
+      povS.label.textContent = 'POV size';
+      pAim.appendChild(povS.node);
+
+      var povHint = el('div', 'fk-hint',
+        'Makin kecil → target harus di tengah layar. Makin besar → seluruh layar boleh.');
+      pAim.appendChild(povHint);
+
       pAim.appendChild(el('div', 'fk-sec', 'Aimbot'));
       var aimT = toggle(!!(window.__pb && window.__pb.state().aim), function (on) { if (on) window.__pb.on(); else window.__pb.off(); });
       pAim.appendChild(row('Aim lock', aimT.node));
@@ -1849,7 +1933,7 @@
       var invertT = toggle(!!O.invert, function (on) { O.invert = on; });
       pAim.appendChild(row('Invert Y', invertT.node));
 
-      /* TAB 2 — ESP */
+      /* ============ TAB 2 — ESP ============ */
       var pVis = addTab('vis', 'ESP');
       pVis.appendChild(el('div', 'fk-sec', 'Overlay'));
       var espT = toggle(!!(window.__pbvis && window.__pbvis.is()), function (on) { if (on) window.__pbvis.on(); else window.__pbvis.off(); });
@@ -1870,7 +1954,7 @@
       var dmgS = slider(1.0, 3.0, 0.05, 1.3, function (v) { return 'x' + v.toFixed(2); }, function (v) { if (window.__pbvis) window.__pbvis.dmg(v); });
       dmgS.label.textContent = 'Damage'; pVis.appendChild(dmgS.node);
 
-      /* TAB 3 — GACOR */
+      /* ============ TAB 3 — GACOR ============ */
       var pGac = addTab('gacor', 'GACOR');
       pGac.appendChild(el('div', 'fk-sec', 'Aim Enhancement'));
       var predT = toggle(!!PR.on, function (on) { window.__pbx.pred(on, PR.ms); });
@@ -1896,7 +1980,7 @@
       var nrecT = toggle(!!FL.noRecoil, function (on) { window.__pbx.noRecoil(on); });
       pGac.appendChild(rowRisk('No recoil', nrecT.node, 'zero recoil'));
 
-      /* TAB 4 — MISC */
+      /* ============ TAB 4 — MISC ============ */
       var pMisc = addTab('misc', 'MISC');
       pMisc.appendChild(el('div', 'fk-sec', 'Quick Swap'));
       var qcT = toggle(!!(window.__pbqc && window.__pbqc.st().on), function (on) { if (on) window.__pbqc.on(); else window.__pbqc.off(); });
@@ -1920,7 +2004,7 @@
       var akT = toggle(!!FL.antiKick, function (on) { window.__pbx.antiKick(on); });
       pMisc.appendChild(rowRisk('Anti-kick', akT.node, 'resists kick/ban'));
 
-      /* TAB 5 — INFO */
+      /* ============ TAB 5 — INFO ============ */
       var pInfo = addTab('info', 'INFO');
       pInfo.appendChild(el('div', 'fk-sec', 'Status'));
       var foot = el('div', 'fk-foot', '');
@@ -1962,19 +2046,25 @@
           if (!s2) { foot.textContent = 'engine not ready…'; return; }
           var parts = [];
           parts.push(s2.aim ? 'AIM ✓' : 'AIM ✕');
+          parts.push(s2.aimMode === 'legacy' ? 'LEGACY' : 'POV');
           parts.push(s2.G ? 'G1' : 'G0');
           parts.push('enemy ' + s2.enemies);
           parts.push('lock ' + s2.lock);
           if (s2.lock) parts.push(s2.dist.toFixed(1) + 'm');
           foot.textContent = parts.join(' · ');
-          statBox.textContent = 'bots ' + s2.bots + ' · fire ' + s2.fire + ' · sens ' + s2.sens + ' · fov ' + s2.fov;
+          statBox.textContent = 'bots ' + s2.bots + ' · fire ' + s2.fire + ' · sens ' + s2.sens + ' · fov ' + s2.fov + ' · pov ' + Math.round(s2.povMargin * 100) + '%';
         } catch (e) { foot.textContent = '…'; }
       }
       setInterval(refreshFoot, 500);
 
       function syncAll() {
         try {
-          if (window.__pb) aimT.set(!!window.__pb.state().aim);
+          if (window.__pb) {
+            aimT.set(!!window.__pb.state().aim);
+            povT.set(window.__pb.state().aimMode !== 'legacy');
+            povS.set(window.__pb.state().povMargin);
+            updateModeInfo();
+          }
           if (window.__pbvis) espT.set(!!window.__pbvis.is());
           if (window.__pbqc) { var q = window.__pbqc.st(); qcT.set(!!q.on); qcFastT.set(!!q.fast); }
           autoFireT.set(!!P.autoFire); invertT.set(!!O.invert);
